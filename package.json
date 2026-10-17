@@ -9,6 +9,7 @@
   },
   "scripts": {
     "preflight": "tsx --env-file-if-exists=.env src/scripts/preflight.ts",
+    "recover-entry": "tsx --env-file-if-exists=.env src/scripts/recover-entry.ts",
     "smoke": "MODE=paper DRY_RUN=false tsx --env-file-if-exists=.env src/scripts/smoke.ts",
     "paper": "MODE=paper tsx --env-file-if-exists=.env src/index.ts",
     "live": "MODE=live tsx --env-file-if-exists=.env src/index.ts",

@@ -111,11 +111,33 @@ export interface EntryParams {
   takeProfit: number | undefined;
 }
 
+export interface ConfirmationClock {
+  now(): number;
+  sleep(ms: number): Promise<void>;
+}
+
+const CONFIRMATION_MS = 60_000;
+const CONFIRMATION_POLL_MS = 500;
+
+function exitAlreadyInProgress(err: unknown): boolean {
+  return /exit order is already in progress/i.test(err instanceof Error ? err.message : String(err));
+}
+
+function isNumeric(value: unknown): value is string | number {
+  return (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) &&
+    Number.isFinite(Number(value));
+}
+
 export class Broker {
   private instrument: Instrument | null = null;
   private readonly request: VenueRequest;
   private entryBlock: string | null = null;
   private readonly blockStore: EntryBlockStore;
+  private readonly clock: ConfirmationClock;
+  private pendingExit: { id: string; reason: string } | null = null;
+  private exiting: Promise<void> | null = null;
+
+  isExitPending(): boolean { return this.pendingExit !== null || this.exiting !== null; }
 
   private setEntryBlock(reason: string | null): void {
     // Keep the in-memory latch even when persisting a failure reason fails.
@@ -128,16 +150,76 @@ export class Broker {
     return this.entryBlock;
   }
 
+  /** Explicit operator recovery for an acknowledged, fully filled, now closed entry. */
+  async recoverCompletedEntry(clientOrderId: string, clear = false): Promise<{
+    clientOrderId: string; orderIds: string[]; filledQuantity: number; cleared: boolean;
+  }> {
+    if (this.cfg.mode !== 'live') throw new Error('Recovery requires MODE=live');
+    if (clear && this.cfg.dryRun) throw new Error('DRY_RUN prevents clearing the journal');
+    if (!/^b[0-9a-f]{32}$/.test(clientOrderId) ||
+        !this.entryBlock?.startsWith(`submission ${clientOrderId} `)) {
+      throw new Error('Client order ID does not match the persisted entry block');
+    }
+    if (this.isExitPending()) throw new Error('Exit confirmation is pending');
+    const all = (await Promise.all(['buy', 'sell'].map(side =>
+      this.readPages('orders', { side, status: 'filled' })))).flat();
+    const orders = all.filter(raw => raw && typeof raw === 'object' &&
+      (raw as Record<string, unknown>).client_order_id === clientOrderId).map(normalizeOrder);
+    if (!orders.length) throw new Error('No terminal filled order found for the blocked submission');
+    let quantity = 0;
+    for (const order of orders) {
+      const raw = order as unknown as Record<string, unknown>;
+      if (order.pair !== this.cfg.pair || order.status !== 'filled' ||
+          (raw.side !== 'buy' && raw.side !== 'sell') ||
+          !isNumeric(raw.remaining_quantity) || Number(raw.remaining_quantity) !== 0 ||
+          !isNumeric(raw.updated_at) || Number(raw.updated_at) <= 0 ||
+          Number(raw.updated_at) > this.clock.now() - CONFIRMATION_MS ||
+          !isNumeric(raw.total_quantity ?? raw.target_quantity ?? raw.quantity) ||
+          !Number.isFinite(order.target_quantity) || order.target_quantity <= 0) {
+        throw new Error('Order is not a settled, fully filled order for this instrument');
+      }
+      const fills = await this.readPages('trades', { pair: this.cfg.pair, order_id: order.id });
+      let filled = 0;
+      for (const value of fills) {
+        const fill = value as Record<string, unknown>;
+        if (!fill || fill.order_id !== order.id || fill.pair !== this.cfg.pair || fill.side !== raw.side ||
+            !isNumeric(fill.quantity) || Number(fill.quantity) <= 0) {
+          throw new Error('Invalid or mismatched fill history; recovery refused');
+        }
+        filled += Number(fill.quantity);
+      }
+      if (Math.abs(filled - order.target_quantity) > 1e-8 * Math.max(1, order.target_quantity)) {
+        throw new Error('Fill history does not account for the complete entry quantity');
+      }
+      quantity += filled;
+    }
+    // A flat snapshot alone cannot prove an uncertain order was never submitted.
+    // Here terminal order state and matching fills establish execution first.
+    for (let check = 0; check < 2; check++) {
+      if (await this.getPosition()) throw new Error('Position is still open; recovery refused');
+      if ((await this.getOpenOrders()).length) throw new Error('Working orders remain; recovery refused');
+      if (check === 0) await this.clock.sleep(2000);
+    }
+    const proof = { clientOrderId, orderIds: orders.map(o => String(o.id)), filledQuantity: quantity, cleared: clear };
+    if (clear) {
+      this.setEntryBlock(null);
+      log.info('completed entry reconciled; operator cleared journal', proof);
+    }
+    return proof;
+  }
+
   constructor(
     private readonly client: CoinDCXClient,
     private readonly cfg: Config,
     private readonly prices: PriceFeed,
     request?: VenueRequest,
     blockStore?: EntryBlockStore,
+    clock?: ConfirmationClock,
   ) {
     this.request = request ?? venueRequest(client, cfg);
     this.blockStore = blockStore ?? entryBlockStore(cfg);
     this.entryBlock = this.blockStore.read();
+    this.clock = clock ?? { now: () => Date.now(), sleep: delay };
     if (this.entryBlock) log.warn('restored entry block; venue reconciliation requires operator review', {
       reason: this.entryBlock,
     });
@@ -296,6 +378,7 @@ export class Broker {
   /** Submit once, confirm the fill, and verify venue protection before returning. */
   async open(params: EntryParams): Promise<FuturesOrderResponse | null> {
     if (this.entryBlock) throw new Error(`Entries blocked: ${this.entryBlock}`);
+    if (this.isExitPending()) throw new Error('Exit confirmation is pending; entry blocked');
     const instrument = this.requireInstrument();
     if (await this.getPosition()) throw new Error('Refusing entry into an existing position');
     if ((await this.getOpenOrders()).length) throw new Error('Working orders exist; entry blocked');
@@ -346,7 +429,27 @@ export class Broker {
       const entryIds = new Set(orders.map(o => o.id));
       state.bump('entries');
       log.info('entry submitted', { id: order.id, clientOrderId, status: order.status });
-      const pos = await this.waitForPosition(p => p !== null, 'Entry fill not visible');
+      let fillObserved = false;
+      const pos = await this.waitForPosition(p => p !== null,
+        () => fillObserved
+          ? 'Entry filled but position remained unavailable within 60s'
+          : 'Entry position not visible within 60s; fill status unconfirmed',
+        async () => {
+          if (fillObserved || this.cfg.mode === 'paper') return;
+          for (const id of entryIds) {
+            const fills = await this.readPages('trades', { pair: this.cfg.pair, order_id: id });
+            if (fills.some((raw: unknown) => {
+              if (!raw || typeof raw !== 'object') return false;
+              const fill = raw as Record<string, unknown>;
+              return fill.order_id === id && fill.pair === this.cfg.pair && fill.side === params.side &&
+                Number.isFinite(Number(fill.quantity)) && Number(fill.quantity) > 0;
+            })) {
+              fillObserved = true;
+              log.info('entry fill observed; awaiting position and protection', { clientOrderId, id });
+              return;
+            }
+          }
+        });
       if (!pos || pos.side !== (params.side === 'buy' ? 'long' : 'short')) {
         throw new Error('Entry resulted in unexpected position direction');
       }
@@ -393,13 +496,32 @@ export class Broker {
   }
 
   private async waitForPosition(predicate: (p: OpenPosition | null) => boolean,
-    failure: string): Promise<OpenPosition | null> {
-    for (let attempt = 0; attempt < 10; attempt++) {
-      const pos = await this.getPosition();
-      if (predicate(pos)) return pos;
-      if (attempt < 9) await delay(500);
+    failure: string | (() => string), observe?: () => Promise<void>): Promise<OpenPosition | null> {
+    const started = this.clock.now(), deadline = started + CONFIRMATION_MS;
+    let nextObservation = started + 5000, reportedReadError = false;
+    let lastError: unknown;
+    while (true) {
+      try {
+        const pos = await this.getPosition();
+        if (predicate(pos)) return pos;
+      } catch (err) {
+        lastError = err;
+        if (!reportedReadError) {
+          reportedReadError = true;
+          log.warn('position confirmation read failed; retrying within deadline', { error: String(err) });
+        }
+      }
+      const now = this.clock.now();
+      if (now >= deadline) break;
+      if (observe && now >= nextObservation) {
+        nextObservation = now + 5000;
+        try { await observe(); }
+        catch (err) { log.warn('entry fill lookup failed; position confirmation continues', { error: String(err) }); }
+      }
+      await this.clock.sleep(Math.min(CONFIRMATION_POLL_MS, Math.max(0, deadline - this.clock.now())));
     }
-    throw new Error(failure);
+    const message = typeof failure === 'function' ? failure() : failure;
+    throw new Error(lastError ? `${message}; last position read: ${String(lastError)}` : message);
   }
 
   /** Verify inline protection, otherwise attach the documented market TP/SL. */
@@ -431,16 +553,45 @@ export class Broker {
 
   /** Exit by position ID and poll until the venue confirms flat. */
   async flatten(reason: string): Promise<void> {
+    if (this.exiting) return this.exiting;
+    this.exiting = this.confirmExit(reason).finally(() => { this.exiting = null; });
+    return this.exiting;
+  }
+
+  private async confirmExit(reason: string): Promise<void> {
     const pos = await this.getPosition();
-    if (!pos) return;
+    if (!pos) {
+      if (this.pendingExit) log.info('exit confirmed flat', this.pendingExit);
+      this.pendingExit = null;
+      return;
+    }
     if (this.cfg.dryRun) {
       log.info('dry-run: would flatten', { reason, id: pos.id });
       return;
     }
-    await this.request('POST', 'positions/exit', { id: pos.id });
-    state.bump('exits');
-    await this.waitForPosition(p => p === null, 'Position still open after exit');
-    log.info('exit confirmed flat', { reason, id: pos.id });
+    if (this.pendingExit && this.pendingExit.id !== pos.id) {
+      throw new Error('Position changed while exit confirmation is pending; operator review required');
+    }
+    if (!this.pendingExit) {
+      this.pendingExit = { id: pos.id, reason };
+      try {
+        await this.request('POST', 'positions/exit', { id: pos.id });
+        state.bump('exits');
+      } catch (err) {
+        if (exitAlreadyInProgress(err)) {
+          log.info('venue exit already in progress; awaiting flat', { id: pos.id });
+        } else if (isDefinitiveRejection(err)) {
+          this.pendingExit = null;
+          throw err;
+        } else {
+          // A timeout may follow acceptance. Poll rather than send a duplicate exit.
+          log.warn('exit submission outcome uncertain; awaiting flat', { id: pos.id, error: String(err) });
+        }
+      }
+    }
+    await this.waitForPosition(p => p === null, 'Position still open after 60s; exit confirmation pending');
+    log.info('exit confirmed flat', this.pendingExit);
+    this.pendingExit = null;
   }
 
   /** Sets leverage on the venue so it matches config before the first entry. */

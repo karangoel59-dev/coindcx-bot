@@ -213,6 +213,12 @@ Return a target, not an order — the engine owns sizing, stops and order placem
   using a hash. It clears the journal only after verified protection and cancellation of entry
   remainders, or a definitive create rejection. An unreadable/corrupt journal prevents startup;
   an unwritable journal prevents entry. Dry-run never clears an existing live block.
+  Blocked entry signals are consumed without sizing or submission; one warning records the
+  block instead of repeating the same failure on every poll. Exits remain available.
+- **Delayed entry confirmation.** The broker polls positions every 500 ms for up to 60 seconds,
+  retrying failed reads. Order-specific trade history distinguishes an observed fill from an
+  unconfirmed submission. A fill alone never clears the journal: position protection must
+  still be verified. A timeout keeps the entry blocked and attempts cancellation/exit.
 - **Verified venue protection.** Entry requests include `stop_loss_price` and optional
   `take_profit_price`. The broker confirms the position’s triggers, attaches structured market
   TP/SL by position ID when needed, and exits if it cannot verify protection. Startup also
@@ -230,8 +236,13 @@ Return a target, not an order — the engine owns sizing, stops and order placem
 - **Positions are read from the venue, never from memory.** Local state drifts.
 - **Startup reconciliation** adopts any existing position rather than opening a second one.
 - **Single-instance PID lock.** Two copies on one account cancel each other's orders.
-- **Exit is confirmed, not assumed.** Exit requests use position IDs; the broker polls up to
-  ten times, 500 ms apart, and raises an error if the position remains open. Malformed exposure
+- **Exit is confirmed, not assumed.** Exit requests use position IDs; the broker polls for up to
+  60 seconds, 500 ms apart, and raises an error if the position remains open. Concurrent exits
+  share one confirmation. An accepted or uncertain exit, including the venue's "already in
+  progress" response, remains pending until flat; subsequent calls confirm it without another
+  submission. Entries and TP/SL changes wait while that exit is pending. If an uncertain exit
+  never completes, inspect the venue rather than blindly retrying it. This pending exit state
+  is in memory; startup reconciliation applies after a restart. Malformed exposure
   responses also raise errors instead of being interpreted as flat. Positions and working
   orders are paginated, and entries are blocked while working orders exist for the pair.
 - **Secrets are scrubbed** from logs by key name.
@@ -267,10 +278,27 @@ on REST polling alone with no socket.
 Keep the process stopped while investigating. Read the reason and client order ID from the
 matching `.bot-state/entry-*.json` file, then review the exchange's order history, working
 orders, fills and actual position. A single flat response after a timeout is insufficient
-evidence that the order was never accepted. Resolve outstanding orders/exposure and verify
-position protection before removing that specific journal file and restarting. Startup
-reconciliation does not clear an uncertain-entry journal automatically. Do not delete all
-journals or replace the API key to bypass a block.
+evidence that the order was never accepted.
+
+For an entry that fully filled and has since closed, run the recovery command from the deployed
+bot directory with the service stopped and the same live configuration. It acquires the bot's
+PID lock and defaults to inspection:
+
+```bash
+MODE=live npm run recover-entry -- --client-order-id b6dae5374dbe342ff969aaeab00a7c9c9
+# After inspection, repeat with --confirm to clear the matching journal:
+MODE=live npm run recover-entry -- --client-order-id b6dae5374dbe342ff969aaeab00a7c9c9 --confirm
+```
+
+Replace the example ID with the ID in your journal. Recovery requires a matching terminal filled
+order at least 60 seconds old, complete matching order-specific fills, and two flat/no-working-order
+checks two seconds apart. It sends no trading mutations. `--confirm` clears only that account and
+instrument's journal; `DRY_RUN=true` prevents clearing. Restart after successful recovery; the next
+finalized candle evaluates the strategy normally.
+
+Rejected, partially filled or unresolved submissions require separate operator reconciliation;
+this command refuses them. Startup reconciliation does not clear an uncertain-entry journal
+automatically. Do not delete all journals or replace the API key to bypass a block.
 
 ---
 

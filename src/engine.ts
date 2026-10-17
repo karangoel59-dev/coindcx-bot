@@ -66,6 +66,7 @@ export class Engine {
   private busy = false;
   private timers: NodeJS.Timeout[] = [];
   private stopping = false;
+  private lastEntryBlockNotice: string | null = null;
 
   constructor(
     private readonly client: CoinDCXClient,
@@ -326,6 +327,10 @@ export class Engine {
   private async applyTarget(target: Target): Promise<void> {
     const pos = await this.broker.getPosition();
     if (this.stopping || this.dataBlocked || (this.pendingTarget !== null && this.pendingTarget !== target)) return;
+    if (this.broker.isExitPending()) {
+      await this.broker.flatten('pending-exit');
+      return;
+    }
     const actual: Target = pos ? pos.side : 'flat';
 
     if (actual === target) {
@@ -343,6 +348,16 @@ export class Engine {
       await this.broker.flatten(`signal:reverse-to-${target}`);
       return;
     }
+
+    const entryBlock = this.broker.getEntryBlock();
+    if (entryBlock) {
+      if (entryBlock !== this.lastEntryBlockNotice) {
+        log.warn('entry skipped while submission requires reconciliation', { reason: entryBlock });
+        this.lastEntryBlockNotice = entryBlock;
+      }
+      return;
+    }
+    this.lastEntryBlockNotice = null;
 
     const mark = this.prices.requireFreshMark();
     const stopLoss =
@@ -379,6 +394,10 @@ export class Engine {
     if (this.stopping || this.busy) return;
 
     await this.withLock('stop-backstop', async () => {
+      if (this.broker.isExitPending()) {
+        await this.broker.flatten('pending-exit');
+        return;
+      }
       const pos = await this.broker.getPosition();
       if (!pos) return;
       const mark = this.prices.getMark();
