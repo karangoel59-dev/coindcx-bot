@@ -134,6 +134,7 @@ market regimes, which is the point of having more than one.
 | `supertrend` | Trend | Seban's ATR bands; in freqtrade's official set | Always in the market when shorts are on → most fees. Tightening the multiplier sharply increases whipsaw. |
 | `rsi2-reversion` | Mean reversion | Connors, *Short Term Trading Strategies That Work* | In the market only ~5% of the time. High win rate, small winners, hurt by trends. |
 | `macd-trend` | Trend | Appel (1979); freqtrade `UniversalMACD` | Smoother than a raw EMA cross but still chops; optional SMA filter. |
+| `trend-vote` | Time-series momentum | Moskowitz, Ooi & Pedersen (2012); Liu & Tsyvinski (2021) for crypto | 20/60/120-bar vote, enters when all agree, exits when the majority is lost. Built for `1d`; trades ~3×/year. The only one backtested here — see below. |
 | `always-long` | — | — | Plumbing test. Refuses to run live. |
 
 Measured over 600 live BTC 1h candles, which confirms each behaves as its
@@ -151,7 +152,7 @@ macd(12/26/9)                    28    53%     47%     0%   <- chops most
 **`ALLOW_SHORTS` is off by default.** Strategies that would short go flat
 instead. A short pays funding and adds a second set of ways to be wrong.
 
-**None of these is backtested here.** They are faithfully implemented against
+**Apart from `trend-vote` (below), none of these is backtested here.** They are faithfully implemented against
 their published rules and unit-tested against hand-computed indicator values —
 which is a statement about correctness, not profitability. Published crypto
 results for these families disagree wildly between sources (one vendor reports
@@ -165,6 +166,65 @@ current bar so a breakout is not self-referential, and a Supertrend with the
 band carry-forward that popular implementations often omit. Every one is
 unit-tested, because a subtly wrong indicator loses money in a way that looks
 like bad luck.
+
+### `trend-vote` and its backtest
+
+`trend-vote` is the one strategy here that was chosen by a backtest rather
+than taken from a book, so the method matters as much as the numbers.
+
+**Setup.** Daily candles for BTC, ETH, SOL, XRP, DOGE, BNB, ADA, LINK and AVAX
+from CoinDCX futures (mid-2022 / early 2023 → Nov 2026). The simulator mirrors
+the engine: act on the candle close; venue stop and take-profit hit intrabar
+(stop assumed first when both are touched); re-entry on the next close after
+a stop, as the engine does; a reversal flattens and enters one candle later;
+0.059% taker fee + 0.02% slippage per side; funding charged at 0.03%/day on
+any open position, either side. Returns are at 1× notional.
+
+**Protocol.** Candidates were compared on data up to 2025-11-13 only. The
+configuration below was fixed *before* the final year was run, and that year
+was run once.
+
+```
+Pick: trend-vote(20/60/120, all), long-only, STOP_LOSS_PCT=0.20, no take-profit
+                          median across 9 coins
+                          CAGR     max DD   coins profitable
+design  (→ 2025-11)      +30%     -52%     9/9    buy & hold: +20%, -62%
+holdout (2025-11 → now)   -6%     -14%     2/9    buy & hold: -52%, -62%
+full period              +18%     -54%     8/9    buy & hold: -4%,  -79%
+```
+
+What that does and does not show:
+
+- In the holdout bear market it **did not make money** — it lost 6% while the
+  coins lost about half. It works by being out of the market (2–24% of the
+  holdout year), not by finding winners in a falling market.
+- With `ALLOW_SHORTS=true` it made +24% (8/9 coins) in the holdout but lost to
+  long-only over the bull years and the full period. Shorts are a bet that
+  the current regime continues, so they are off by default.
+- Over the full period, long-only beat every other strategy here and buy &
+  hold, on 8 of 9 coins. A 54% median drawdown at 1× is still large: size it
+  with that in mind.
+- Four years, one exchange, nine correlated coins. This is evidence, not proof.
+
+**It needs a wide stop and no take-profit.** With `STOP_LOSS_PCT=0.015` and
+`TAKE_PROFIT_PCT=0.03`, *every* strategy here lost money on *every* coin in
+the same backtest, trend-vote included (−57%/yr median): daily noise trips
+the stop, the engine re-enters on the next close, and fees compound. Use the
+stop as a catastrophe stop (~0.2) and unset `TAKE_PROFIT_PCT`.
+
+Because entries are sized as `RISK_PERCENT / STOP_LOSS_PCT` of equity, a 20%
+stop at the default 0.5% risk means a position of only 2.5% of equity. Raise
+`RISK_PERCENT` deliberately if you want more exposure; `MAX_ORDER_NOTIONAL`
+still caps it.
+
+```
+STRATEGY=trend-vote
+CANDLE_INTERVAL=1d
+TREND_VOTE_LOOKBACKS=20,60,120
+TREND_VOTE_ENTRY=all
+STOP_LOSS_PCT=0.2
+# TAKE_PROFIT_PCT unset
+```
 
 ### Writing a strategy
 

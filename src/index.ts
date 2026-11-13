@@ -19,6 +19,7 @@ import { EmaCrossStrategy } from './strategies/ema-cross.js';
 import { MacdTrendStrategy } from './strategies/macd-trend.js';
 import { Rsi2ReversionStrategy } from './strategies/rsi2-reversion.js';
 import { SupertrendStrategy } from './strategies/supertrend.js';
+import { TrendVoteStrategy } from './strategies/trend-vote.js';
 
 function buildStrategy(cfg: Config): Strategy {
   switch (cfg.strategy) {
@@ -53,6 +54,12 @@ function buildStrategy(cfg: Config): Strategy {
         slowPeriod: cfg.macdSlow,
         signalPeriod: cfg.macdSignal,
         trendSmaPeriod: cfg.macdTrendSmaPeriod,
+        allowShorts: cfg.allowShorts,
+      });
+    case 'trend-vote':
+      return new TrendVoteStrategy({
+        lookbacks: cfg.trendVoteLookbacks,
+        entry: cfg.trendVoteEntry,
         allowShorts: cfg.allowShorts,
       });
   }

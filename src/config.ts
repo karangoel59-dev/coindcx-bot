@@ -127,6 +127,9 @@ export interface Config {
   macdSignal: number;
   macdTrendSmaPeriod: number;
 
+  trendVoteLookbacks: number[];
+  trendVoteEntry: 'all' | 'majority';
+
   warmupCandles: number;
 }
 
@@ -136,6 +139,7 @@ export type StrategyName =
   | 'supertrend'
   | 'rsi2-reversion'
   | 'macd-trend'
+  | 'trend-vote'
   | 'always-long';
 
 const STRATEGY_NAMES: readonly StrategyName[] = [
@@ -144,6 +148,7 @@ const STRATEGY_NAMES: readonly StrategyName[] = [
   'supertrend',
   'rsi2-reversion',
   'macd-trend',
+  'trend-vote',
   'always-long',
 ];
 
@@ -241,6 +246,20 @@ export function loadConfig(): Config {
   }
   const macdTrendSmaPeriod = num('MACD_TREND_SMA_PERIOD', 0);
 
+  const trendVoteLookbacks = str('TREND_VOTE_LOOKBACKS', '20,60,120')
+    .split(',')
+    .map(part => Number(part.trim()));
+  if (trendVoteLookbacks.some(l => !Number.isInteger(l) || l <= 0)) {
+    throw new Error('TREND_VOTE_LOOKBACKS must be a comma-separated list of positive integers');
+  }
+  if (new Set(trendVoteLookbacks).size !== trendVoteLookbacks.length) {
+    throw new Error('TREND_VOTE_LOOKBACKS must not repeat a lookback');
+  }
+  const trendVoteEntry = str('TREND_VOTE_ENTRY', 'all');
+  if (trendVoteEntry !== 'all' && trendVoteEntry !== 'majority') {
+    throw new Error(`TREND_VOTE_ENTRY must be "all" or "majority", got "${trendVoteEntry}"`);
+  }
+
   const rawStrategy = str('STRATEGY', 'ema-cross');
   if (!STRATEGY_NAMES.includes(rawStrategy as StrategyName)) {
     throw new Error(
@@ -333,6 +352,8 @@ export function loadConfig(): Config {
     macdSlow,
     macdSignal,
     macdTrendSmaPeriod,
+    trendVoteLookbacks,
+    trendVoteEntry,
     warmupCandles,
   };
 }
