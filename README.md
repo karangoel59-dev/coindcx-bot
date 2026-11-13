@@ -311,8 +311,12 @@ Return a target, not an order — the engine owns sizing, stops and order placem
   no error. A `process.on('exit')` breadcrumb logs loudly if it ever ends without a signal anyway.
 - **A watchdog reports liveness every 60s**, and warns when the quote feed goes stale, candles go
   overdue, or the socket is down — because a bot with a dead feed otherwise looks exactly like a
-  bot with no signal. Websocket reconnection is raised from the SDK's default of 10 attempts
-  (after which it gives up permanently) to effectively unlimited.
+  bot with no signal.
+- **The websocket always reconnects.** The SDK's own loop gives up after a single failed retry
+  (a retry that fails raises `connect_error`, not `disconnect`, so nothing schedules the next
+  one); in production that left the bot on REST polling for 4.5 days. `src/ws-supervisor.ts`
+  replaces it: it retries after every failure or hung connect with capped backoff (2s → 60s),
+  rechecks every 60s in case an event is missed, and discards each dead socket.
 
 Set `WS_URL` to a dead address (e.g. `WS_URL=http://127.0.0.1:9`) to verify the bot keeps running
 on REST polling alone with no socket.
