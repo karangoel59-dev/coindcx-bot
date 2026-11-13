@@ -15,6 +15,7 @@ import { DonchianBreakoutStrategy } from '../src/strategies/donchian-breakout.js
 import { Rsi2ReversionStrategy } from '../src/strategies/rsi2-reversion.js';
 import { SupertrendStrategy } from '../src/strategies/supertrend.js';
 import { MacdTrendStrategy } from '../src/strategies/macd-trend.js';
+import { TrendVoteStrategy } from '../src/strategies/trend-vote.js';
 import { RunningMacd } from '../src/strategies/indicators.js';
 import { log } from '../src/logger.js';
 import type { Candle } from '../src/strategy.js';
@@ -323,6 +324,7 @@ test('every strategy reports requiredCandles and refuses to signal before warmup
     new MacdTrendStrategy({
       fastPeriod: 12, slowPeriod: 26, signalPeriod: 9, trendSmaPeriod: 0, allowShorts: false,
     }),
+    new TrendVoteStrategy({ lookbacks: [20, 60, 120], entry: 'all', allowShorts: false }),
   ];
   for (const s of strategies) {
     assert.ok(s.requiredCandles > 0, `${s.name} must declare requiredCandles`);
@@ -334,4 +336,55 @@ test('every strategy reports requiredCandles and refuses to signal before warmup
   // The 200-SMA variant must demand real history.
   const rsiStrategy = strategies[2] as Rsi2ReversionStrategy;
   assert.ok(rsiStrategy.requiredCandles > 200, 'rsi2 with a 200 SMA needs >200 candles');
+});
+
+// --- trend-vote ----------------------------------------------------------------
+
+const votes = (entry: 'all' | 'majority', allowShorts = false) =>
+  new TrendVoteStrategy({ lookbacks: [1, 2, 3], entry, allowShorts });
+/** Feeds closes one by one and returns the target after each. */
+function feed(s: TrendVoteStrategy, closes: readonly number[]): string[] {
+  return fromCloses(closes).map(c => s.onClosedCandle(c));
+}
+
+test('trend-vote needs max(lookback) + 1 candles and rejects bad lookbacks', () => {
+  assert.equal(new TrendVoteStrategy({ lookbacks: [20, 60, 120], entry: 'all', allowShorts: false }).requiredCandles, 121);
+  assert.throws(() => new TrendVoteStrategy({ lookbacks: [], entry: 'all', allowShorts: false }));
+  assert.throws(() => new TrendVoteStrategy({ lookbacks: [0, 5], entry: 'all', allowShorts: false }));
+  assert.throws(() => new TrendVoteStrategy({ lookbacks: [2.5], entry: 'all', allowShorts: false }));
+});
+
+test('trend-vote "all" waits for every lookback to agree; "majority" does not', () => {
+  // Last close 11.5 is below the 1-bar-ago close but above the 2- and 3-bar ones: vote +1.
+  const closes = [10, 11, 12, 11.5];
+  assert.equal(feed(votes('all'), closes).at(-1), 'flat');
+  assert.equal(feed(votes('majority'), closes).at(-1), 'long');
+  // Every lookback up: vote +3.
+  assert.equal(feed(votes('all'), [10, 11, 12, 13]).at(-1), 'long');
+});
+
+test('trend-vote holds while the majority agrees and exits when it is lost', () => {
+  const s = votes('all');
+  // 13: vote +3 -> long. 12.5: vote +1 -> hold (hysteresis). 11.5: vote -3 -> flat.
+  assert.deepEqual(feed(s, [10, 11, 12, 13, 12.5, 11.5]), ['flat', 'flat', 'flat', 'long', 'long', 'flat']);
+});
+
+test('trend-vote only shorts when shorts are enabled', () => {
+  const falling = [13, 12, 11, 10];
+  assert.equal(feed(votes('all'), falling).at(-1), 'flat');
+  assert.equal(feed(votes('all', true), falling).at(-1), 'short');
+  // A short is held on a partial bounce (vote -1) and closed when the majority flips.
+  assert.deepEqual(feed(votes('all', true), [13, 12, 11, 10, 10.5, 10.8]).slice(3), ['short', 'short', 'flat']);
+  // A bounce above every lookback reverses straight to long (the engine flattens first).
+  assert.equal(feed(votes('all', true), [13, 12, 11, 10, 10.5, 12.5]).at(-1), 'long');
+});
+
+test('trend-vote seeds its hysteresis from history so a restart mid-trend keeps the position', () => {
+  const s = votes('all');
+  s.warmup(fromCloses([10, 11, 12, 13, 12.5]));
+  assert.equal(s.currentTarget(), 'long');
+  // The same final bars without the entry in view would not enter on their own.
+  const fresh = votes('all');
+  fresh.warmup(fromCloses([11, 12, 13, 12.5]));
+  assert.equal(fresh.currentTarget(), 'flat');
 });
