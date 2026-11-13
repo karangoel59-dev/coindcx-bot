@@ -20,6 +20,7 @@ import { MacdTrendStrategy } from './strategies/macd-trend.js';
 import { Rsi2ReversionStrategy } from './strategies/rsi2-reversion.js';
 import { SupertrendStrategy } from './strategies/supertrend.js';
 import { TrendVoteStrategy } from './strategies/trend-vote.js';
+import { discardStaleSdkSocket, WsSupervisor } from './ws-supervisor.js';
 
 function buildStrategy(cfg: Config): Strategy {
   switch (cfg.strategy) {
@@ -121,11 +122,12 @@ async function main(): Promise<void> {
   await broker.syncLeverage();
   await engine.warmup();
 
-  // The SDK stops reconnecting for good after 10 attempts. A bot that loses
-  // its socket permanently and never says so is worse than one that keeps
-  // retrying forever, so raise the ceiling.
-  client.ws.setMaxRetries(100_000);
-  client.ws.setAutoReconnect(true);
+  // The SDK's own reconnect loop dies after a single failed attempt (see
+  // ws-supervisor.ts); the supervisor replaces it. Started after the initial
+  // connect below so the two do not race to open the first socket.
+  const wsSupervisor = new WsSupervisor(client.ws, {
+    discardStale: () => discardStaleSdkSocket(client.ws),
+  });
 
   // Make socket transitions visible. Previously a drop was logged only by the
   // SDK's own logger and nothing in this process reacted to it.
@@ -147,13 +149,21 @@ async function main(): Promise<void> {
   // credentials will land here.
   try {
     await client.connectWebsocket();
-    client.subscribePrivateStreams();
     state.update({ wsConnected: true });
     log.info('websocket connected');
   } catch (err) {
     state.update({ wsConnected: false });
-    log.warn('websocket unavailable; running on REST polling only', { error: String(err) });
+    log.warn('websocket unavailable; running on REST polling until it reconnects', { error: String(err) });
   }
+  // Registered either way: on a down socket the SDK records the user channel
+  // and joins it on the next connect, so private order/position updates come
+  // back with the socket instead of only when the first connect succeeded.
+  try {
+    client.subscribePrivateStreams();
+  } catch (err) {
+    log.warn('private streams not subscribed', { error: String(err) });
+  }
+  wsSupervisor.start();
 
   // Must come after the websocket attempt so the depth subscription lands on a
   // live socket; the REST refresh timer it also starts works either way.
@@ -183,6 +193,7 @@ async function main(): Promise<void> {
     });
     engine.stop();
     prices.stop();
+    wsSupervisor.stop();
     dashboard?.close();
     try {
       client.disconnect();
